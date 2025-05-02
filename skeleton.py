@@ -34,9 +34,9 @@ class DetermineColor(Node):
             # msg.frame_id = '0'  # STOP
             # msg.frame_id = '-1' # CW 
             if red_intensity>blue_intensity:
-            	msg.frame_id = "-1"
+            	msg.frame_id = '-1'
             if blue_intensity>red_intensity:
-            	msg.frame_id = "+1"            
+            	msg.frame_id = '+1'            
             
             
             
