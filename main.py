@@ -2,9 +2,9 @@
 import rclpy
 from rclpy.node import Node
 
-from sensor_msgs.msg import Image, CompressedImage
-from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image
 from std_msgs.msg import Header
+from cv_bridge import CvBridge, CvBridgeError
 
 import cv2
 import numpy as np
@@ -17,71 +17,95 @@ class DetermineColor(Node):
         self.bridge = CvBridge()
 
     def callback(self, data):
+        self.get_logger().info("Image received")
+        msg = Header()
+        msg = data.header
+        msg.frame_id = '0'  # 기본값: STOP
+
         try:
-            # listen image topic
             image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-
-            # prepare rotate_cmd msg
-            # DO NOT DELETE THE BELOW THREE LINES!
-            msg = Header()
-            msg = data.header
-            msg.frame_id = '0'  # default: STOP
-
-            # determine background color
-            # TODO
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5,5), 0)
-            edges = cv2.Canny(blur, 50, 150)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if not contours:
-                self.color_pub.publish(msg)
-                return
+            # 밝은 영역만 추출 (모니터)
+            _, thresh = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            max_contour = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(max_contour)
-            area = cv2.contourArea(hull)
-            if area < 10000:
-                self.color_pub.publish(msg)
-                return
+            if contours:
+                # 가장 큰 밝은 영역 선택
+                monitor_contour = max(contours, key=cv2.contourArea)
+                rect = cv2.minAreaRect(monitor_contour)
+                box = cv2.boxPoints(rect)
+                box = np.int0(box)
 
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(mask, [hull], -1, 255, thickness=-1)
+                # Perspective transform
+                box = self.order_points(box)
+                dst_size = 200
+                dst_pts = np.array([
+                    [0, 0],
+                    [dst_size - 1, 0],
+                    [dst_size - 1, dst_size - 1],
+                    [0, dst_size - 1]
+                ], dtype='float32')
+                M = cv2.getPerspectiveTransform(box, dst_pts)
+                warped = cv2.warpPerspective(image, M, (dst_size, dst_size))
+                hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
-            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-            hsv_masked = cv2.bitwise_and(hsv, hsv, mask=mask)
+                # 색상 범위 정의
+                lower_blue = np.array([85, 50, 30])
+                upper_blue = np.array([140, 255, 255])
+                lower_red1 = np.array([0, 50, 30])
+                upper_red1 = np.array([10, 255, 255])
+                lower_red2 = np.array([160, 50, 30])
+                upper_red2 = np.array([180, 255, 255])
 
-            lower_blue = np.array([100, 150, 50])
-            upper_blue = np.array([140, 255, 255])
-            mask_blue = cv2.inRange(hsv_masked, lower_blue, upper_blue)
+                mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+                mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+                mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+                mask_red = cv2.bitwise_or(mask_red1, mask_red2)
 
-            lower_red1 = np.array([0, 70, 50])
-            upper_red1 = np.array([10, 255, 255])
-            lower_red2 = np.array([170, 70, 50])
-            upper_red2 = np.array([180, 255, 255])
-            mask_red1 = cv2.inRange(hsv_masked, lower_red1, upper_red1)
-            mask_red2 = cv2.inRange(hsv_masked, lower_red2, upper_red2)
-            mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+                total_pixels = warped.shape[0] * warped.shape[1]
+                blue_count = cv2.countNonZero(mask_blue)
+                red_count = cv2.countNonZero(mask_red)
+                other_count = total_pixels - (blue_count + red_count)
 
-            blue_count = cv2.countNonZero(mask_blue)
-            red_count = cv2.countNonZero(mask_red)
+                self.get_logger().info(f"blue={blue_count}, red={red_count}, other={other_count}")
 
-            if blue_count > red_count and blue_count > 1000:
-                msg.frame_id = '+1'  # CCW
-            elif red_count > blue_count and red_count > 1000:
-                msg.frame_id = '-1'  # CW
+                if blue_count > red_count and blue_count > other_count:
+                    msg.frame_id = '+1'
+                elif red_count > blue_count and red_count > other_count:
+                    msg.frame_id = '-1'
+                else:
+                    msg.frame_id = '0'
+
             else:
-                msg.frame_id = '0'   # STOP
+                self.get_logger().info("No bright region found.")
 
-            # publish color_state
-            self.color_pub.publish(msg)
         except CvBridgeError as e:
-            self.get_logger().error('Failed to convert image: %s' % e)
+            self.get_logger().error(f'CvBridge Error: {e}')
+        except Exception as e:
+            self.get_logger().error(f'Unhandled exception: {e}')
 
+        # 항상 publish!
+        self.color_pub.publish(msg)
+        self.get_logger().info(f'Published rotate_cmd: {msg.frame_id}')
+
+    def order_points(self, pts):
+        rect = np.zeros((4, 2), dtype='float32')
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DetermineColor()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
-    rclpy.init()
-    detector = DetermineColor()
-    rclpy.spin(detector)
-    detector.destroy_node()
-    rclpy.shutdown()
+    main()
